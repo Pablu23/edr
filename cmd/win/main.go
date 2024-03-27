@@ -1,36 +1,101 @@
 package main
 
 import (
-	"cmp"
+	"bytes"
+	"crypto/sha256"
+	"edr/pkg/common"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"github.com/google/uuid"
 	"golang.org/x/sys/windows"
+	"io"
+	"net/http"
+	"os"
 	"reflect"
-	"slices"
-	"strings"
+	"time"
 )
 
 func main() {
-	err, p := getPidAndPath()
-	if err != nil {
-		panic(err)
-	}
+	//fExists := true
+	//_, err = os.Stat("running.txt")
+	//if err != nil && errors.Is(err, os.ErrNotExist) {
+	//	fExists = false
+	//} else if err != nil {
+	//	panic(err)
+	//}
+	//var file *os.File
+	//if !fExists {
+	//	file, _ = os.Create("running.txt")
+	//	defer file.Close()
+	//}
 
-	slices.SortStableFunc(p, func(a, b Proc) int {
-		return cmp.Compare(a.PID, b.PID)
-	})
+	cPid := windows.GetCurrentProcessId()
 
-	for _, proc := range p {
-		if proc.Err != nil {
-			fmt.Printf("PID: %d Error: %s\n", proc.PID, proc.Err)
-		} else {
-			fmt.Printf("PID: %d Name: %s\n", proc.PID, proc.Path)
-			if strings.Contains(proc.Path, "Taskmgr.exe") {
-				err := proc.Terminate()
+	clientId := uuid.New()
+	for {
+		err, p := getPidAndPath()
+		if err != nil {
+			panic(err)
+		}
+
+		r := make([]common.Proc, 0)
+		for _, proc := range p {
+			if proc.Err != nil {
+				fmt.Printf("PID: %d Error: %s\n", proc.PID, proc.Err)
+			} else {
+				hash, err := getHash(proc)
 				if err != nil {
-					fmt.Printf("ERROR CLOSING TASKMANAGER: %v\n", err)
+					panic(err)
 				}
+
+				//if !fExists {
+				//	_, err = file.WriteString(fmt.Sprintf("%s;%s\n", proc.Path, hex.EncodeToString(hash)))
+				//	if err != nil {
+				//		panic(err)
+				//	}
+				//}
+
+				r = append(r, common.Proc{
+					ExePath: proc.Path,
+					HashHex: hex.EncodeToString(hash),
+					PID:     proc.PID,
+				})
 			}
 		}
+
+		info := common.ClientInfo{
+			ID:      clientId,
+			Running: r,
+		}
+		j, err := json.Marshal(info)
+		if err != nil {
+			panic(err)
+		}
+		post, err := http.Post("http://localhost:8080/client/", "application/json", bytes.NewBuffer(j))
+		if err != nil {
+			panic(err)
+		}
+		var k []uint32
+		err = json.NewDecoder(post.Body).Decode(&k)
+		if err != nil {
+			panic(err)
+		}
+		//fmt.Printf("Status: %s\n", post.Status)
+		for _, u := range k {
+			fmt.Printf("Terminating PID: %d\n", u)
+			if u == cPid {
+				fmt.Printf("Skippping self")
+				continue
+			}
+
+			err := Terminate(u)
+			if err != nil {
+				fmt.Printf("Could not terminate: PID %d, because error: %s\n", u, err)
+			}
+		}
+
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -40,12 +105,26 @@ type Proc struct {
 	Err  error
 }
 
-func (p *Proc) Terminate() error {
-	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, p.PID)
+func Terminate(pid uint32) error {
+	handle, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
 	if err != nil {
 		return err
 	}
 	return windows.TerminateProcess(handle, 1337)
+}
+
+func getHash(p Proc) ([]byte, error) {
+	file, err := os.Open(p.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, file); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }
 
 func getPidAndPath() (error, []Proc) {
